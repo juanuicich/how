@@ -27,6 +27,10 @@ const basePromptTmpl = `You are a shell command generator. The user describes a 
 
 const explainTemplate = "Explain this shell command in well-formatted Markdown. Start with a one-line summary, then break down each part: subcommands, flags, and arguments. Be precise but concise. If you use a table, left-align all columns (`:---`) and keep it compact.\n\nCommand:\n```\n%s\n```"
 
+const installCmd = "go install github.com/juanuicich/how@latest"
+
+const releasesBase = "https://github.com/juanuicich/how/releases/tag/v"
+
 func osLabel() string {
 	switch runtime.GOOS {
 	case "darwin":
@@ -55,6 +59,7 @@ const (
 	stateCommand
 	stateRefine
 	stateExplainLoading
+	stateUpdate
 )
 
 type claudeMsg struct {
@@ -76,7 +81,6 @@ type model struct {
 	height        int
 	err           error
 	exitAndRun    bool
-	exitAndUpdate bool
 	explainOutput string
 	latestVersion string
 }
@@ -338,9 +342,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(m.spinner.Tick, callClaude(nil, m.command, true, max(40, m.width-6)))
 			case "u":
 				if m.latestVersion != "" {
-					m.exitAndUpdate = true
-					return m, tea.Quit
+					m.state = stateUpdate
+					return m, nil
 				}
+			}
+		case stateUpdate:
+			switch msg.String() {
+			case "q", "ctrl+c", "esc":
+				return m, tea.Quit
+			case "enter":
+				m.command = installCmd
+				m.exitAndRun = true
+				return m, tea.Quit
 			}
 		case stateRefine:
 			switch msg.String() {
@@ -381,7 +394,11 @@ func (m model) View() string {
 	questionW := max(10, contentW-7)
 
 	box := commandBox.Width(boxW)
-	question := questionStyle.Width(questionW).Render(m.question)
+	subtitle := m.question
+	if m.state == stateUpdate {
+		subtitle = "update available: v" + m.latestVersion
+	}
+	question := questionStyle.Width(questionW).Render(subtitle)
 
 	header := lipgloss.JoinHorizontal(
 		lipgloss.Top,
@@ -430,6 +447,18 @@ func (m model) View() string {
 			"",
 			m.spinner.View()+" "+questionStyle.Render("explaining..."),
 		)
+
+	case stateUpdate:
+		sections = append(sections,
+			box.Render(installCmd),
+			"",
+			hints(
+				[2]string{"enter", "run"},
+				[2]string{"q", "quit"},
+			),
+			"",
+			hintLabel.Render("or grab a binary from ")+keyStyle.Render(releasesBase+m.latestVersion),
+		)
 	}
 
 	return pageStyle.Render(lipgloss.JoinVertical(lipgloss.Left, sections...))
@@ -468,29 +497,36 @@ func hints(pairs ...[2]string) string {
 	return strings.Join(parts, hintLabel.Render("  ·  "))
 }
 
-func printUpgrade(latest string) {
-	heading := titleStyle.Render("how") + "  " + questionStyle.Render("update available: v"+latest)
-	cmd := commandBox.Render("go install github.com/juanuicich/how@latest")
-	link := hintLabel.Render("or grab a binary from ") +
-		keyStyle.Render("https://github.com/juanuicich/how/releases/tag/v"+latest)
-	body := lipgloss.JoinVertical(lipgloss.Left, heading, "", cmd, "", link)
-	fmt.Println(pageStyle.Render(body))
-}
-
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "how — natural language to shell commands")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "usage: how <what you want to do>")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "examples:")
-	fmt.Fprintln(w, "  how list files modified in the last hour")
-	fmt.Fprintln(w, "  how find processes using port 3000")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "flags:")
-	fmt.Fprintln(w, "  -h, --help       show this help")
-	fmt.Fprintln(w, "  -v, --version    print version")
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "requires the `claude` CLI (https://docs.claude.com/claude-code) on PATH and logged in.")
+	cmdStyle := lipgloss.NewStyle().Foreground(good).Bold(true)
+	section := lipgloss.NewStyle().Foreground(muted).Bold(true)
+
+	header := lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		titleStyle.Render("how"),
+		"  ",
+		questionStyle.Render("natural language to shell commands"),
+	)
+
+	body := lipgloss.JoinVertical(
+		lipgloss.Left,
+		header,
+		"",
+		section.Render("USAGE"),
+		"  "+cmdStyle.Render("how")+" "+hintLabel.Render("<what you want to do>"),
+		"",
+		section.Render("EXAMPLES"),
+		"  "+cmdStyle.Render("how")+" "+hintLabel.Render("list files modified in the last hour"),
+		"  "+cmdStyle.Render("how")+" "+hintLabel.Render("find processes using port 3000"),
+		"",
+		section.Render("FLAGS"),
+		"  "+keyStyle.Render("-h, --help")+"     "+hintLabel.Render("show this help"),
+		"  "+keyStyle.Render("-v, --version")+"  "+hintLabel.Render("print version"),
+		"",
+		hintLabel.Render("requires the ")+cmdStyle.Render("claude")+hintLabel.Render(" CLI (")+keyStyle.Render("https://docs.claude.com/claude-code")+hintLabel.Render(") on PATH and logged in."),
+	)
+
+	fmt.Fprintln(w, pageStyle.Render(body))
 }
 
 func main() {
@@ -524,7 +560,7 @@ func main() {
 	if !ok {
 		os.Exit(1)
 	}
-	if m.explainOutput != "" && m.command != "" && !m.exitAndRun && !m.exitAndUpdate {
+	if m.explainOutput != "" && m.command != "" && !m.exitAndRun {
 		fmt.Print(m.explainOutput)
 		contentW := max(20, m.width-4)
 		boxW := max(10, contentW-6)
@@ -546,12 +582,23 @@ func main() {
 		case 'r':
 			m.exitAndRun = true
 		case 'u':
-			m.exitAndUpdate = true
+			upgrade := lipgloss.JoinVertical(
+				lipgloss.Left,
+				commandBox.Width(boxW).Render(installCmd),
+				"",
+				hints(
+					[2]string{"enter", "run"},
+					[2]string{"q", "quit"},
+				),
+				"",
+				hintLabel.Render("or grab a binary from ")+keyStyle.Render(releasesBase+m.latestVersion),
+			)
+			fmt.Println(pageStyle.Render(upgrade))
+			if readKey(false) == 'r' {
+				m.command = installCmd
+				m.exitAndRun = true
+			}
 		}
-	}
-	if m.exitAndUpdate {
-		printUpgrade(m.latestVersion)
-		return
 	}
 	if m.exitAndRun && m.command != "" {
 		fmt.Printf("\033[2m$\033[0m %s\n", m.command)

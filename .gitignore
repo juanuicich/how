@@ -10,3 +10,10 @@
 
 # recordings
 *.cast
+
+# agent instructions (local only)
+CLAUDE.md
+AGENTS.md
+
+# test binaries
+tmp-how-*
