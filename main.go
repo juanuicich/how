@@ -1,11 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -39,6 +42,8 @@ type claudeMsg struct {
 	forExplain bool
 }
 
+type updateMsg struct{ latest string }
+
 type model struct {
 	state         state
 	question      string
@@ -50,7 +55,9 @@ type model struct {
 	height        int
 	err           error
 	exitAndRun    bool
+	exitAndUpdate bool
 	explainOutput string
+	latestVersion string
 }
 
 var (
@@ -107,7 +114,86 @@ func initialModel(question string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, callClaude(nil, m.question, false, 0))
+	return tea.Batch(m.spinner.Tick, callClaude(nil, m.question, false, 0), checkForUpdate())
+}
+
+func checkForUpdate() tea.Cmd {
+	return func() tea.Msg {
+		cur, ok := parseSemver(version)
+		if !ok {
+			return updateMsg{}
+		}
+		client := &http.Client{Timeout: 3 * time.Second}
+		req, err := http.NewRequest("GET", "https://api.github.com/repos/juanuicich/how/releases/latest", nil)
+		if err != nil {
+			return updateMsg{}
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return updateMsg{}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return updateMsg{}
+		}
+		var body struct {
+			TagName string `json:"tag_name"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			return updateMsg{}
+		}
+		latest, ok := parseSemver(body.TagName)
+		if !ok {
+			return updateMsg{}
+		}
+		if semverLess(cur, latest) {
+			return updateMsg{latest: strings.TrimPrefix(body.TagName, "v")}
+		}
+		return updateMsg{}
+	}
+}
+
+func parseSemver(s string) ([3]int, bool) {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	var v [3]int
+	parts := strings.SplitN(s, ".", 4)
+	if len(parts) < 3 {
+		return v, false
+	}
+	for i := 0; i < 3; i++ {
+		p := parts[i]
+		// strip any pre-release/build suffix on the patch number
+		if i == 2 {
+			for j := 0; j < len(p); j++ {
+				if p[j] < '0' || p[j] > '9' {
+					p = p[:j]
+					break
+				}
+			}
+		}
+		if p == "" {
+			return v, false
+		}
+		n := 0
+		for j := 0; j < len(p); j++ {
+			if p[j] < '0' || p[j] > '9' {
+				return v, false
+			}
+			n = n*10 + int(p[j]-'0')
+		}
+		v[i] = n
+	}
+	return v, true
+}
+
+func semverLess(a, b [3]int) bool {
+	for i := 0; i < 3; i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return false
 }
 
 func callClaude(history []turn, userMsg string, forExplain bool, wrapWidth int) tea.Cmd {
@@ -189,6 +275,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateCommand
 		return m, nil
 
+	case updateMsg:
+		m.latestVersion = msg.latest
+		return m, nil
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
@@ -211,6 +301,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "e":
 				m.state = stateExplainLoading
 				return m, tea.Batch(m.spinner.Tick, callClaude(nil, m.command, true, max(40, m.width-6)))
+			case "u":
+				if m.latestVersion != "" {
+					m.exitAndUpdate = true
+					return m, tea.Quit
+				}
 			}
 		case stateRefine:
 			switch msg.String() {
@@ -271,12 +366,16 @@ func (m model) View() string {
 		} else {
 			sections = append(sections, box.Render(m.command))
 		}
-		sections = append(sections, "", hints(
-			[2]string{"enter", "run"},
-			[2]string{"tab", "refine"},
-			[2]string{"e", "explain"},
-			[2]string{"q", "quit"},
-		))
+		pairs := [][2]string{
+			{"enter", "run"},
+			{"tab", "refine"},
+			{"e", "explain"},
+			{"q", "quit"},
+		}
+		if m.latestVersion != "" {
+			pairs = append(pairs, [2]string{"u", "update v" + m.latestVersion})
+		}
+		sections = append(sections, "", hints(pairs...))
 
 	case stateRefine:
 		sections = append(sections,
@@ -301,21 +400,29 @@ func (m model) View() string {
 	return pageStyle.Render(lipgloss.JoinVertical(lipgloss.Left, sections...))
 }
 
-func pressedEnter() bool {
+// readKey blocks for one keystroke and returns 'r' for enter, 'u' for the
+// update key, or 0 for anything else.
+func readKey(updateAvailable bool) byte {
 	fd := int(os.Stdin.Fd())
 	if !term.IsTerminal(fd) {
-		return false
+		return 0
 	}
 	old, err := term.MakeRaw(fd)
 	if err != nil {
-		return false
+		return 0
 	}
 	defer term.Restore(fd, old)
 	var buf [1]byte
 	if _, err := os.Stdin.Read(buf[:]); err != nil {
-		return false
+		return 0
 	}
-	return buf[0] == '\r' || buf[0] == '\n'
+	switch {
+	case buf[0] == '\r' || buf[0] == '\n':
+		return 'r'
+	case updateAvailable && buf[0] == 'u':
+		return 'u'
+	}
+	return 0
 }
 
 func hints(pairs ...[2]string) string {
@@ -324,6 +431,15 @@ func hints(pairs ...[2]string) string {
 		parts = append(parts, keyStyle.Render(p[0])+" "+hintLabel.Render(p[1]))
 	}
 	return strings.Join(parts, hintLabel.Render("  ·  "))
+}
+
+func printUpgrade(latest string) {
+	heading := titleStyle.Render("how") + "  " + questionStyle.Render("update available: v"+latest)
+	cmd := commandBox.Render("go install github.com/juanuicich/how@latest")
+	link := hintLabel.Render("or grab a binary from ") +
+		keyStyle.Render("https://github.com/juanuicich/how/releases/tag/v"+latest)
+	body := lipgloss.JoinVertical(lipgloss.Left, heading, "", cmd, "", link)
+	fmt.Println(pageStyle.Render(body))
 }
 
 func printUsage(w io.Writer) {
@@ -373,23 +489,34 @@ func main() {
 	if !ok {
 		os.Exit(1)
 	}
-	if m.explainOutput != "" && m.command != "" && !m.exitAndRun {
+	if m.explainOutput != "" && m.command != "" && !m.exitAndRun && !m.exitAndUpdate {
 		fmt.Print(m.explainOutput)
 		contentW := max(20, m.width-4)
 		boxW := max(10, contentW-6)
+		pairs := [][2]string{
+			{"enter", "run"},
+			{"q", "quit"},
+		}
+		if m.latestVersion != "" {
+			pairs = append(pairs, [2]string{"u", "update v" + m.latestVersion})
+		}
 		footer := lipgloss.JoinVertical(
 			lipgloss.Left,
 			commandBox.Width(boxW).Render(m.command),
 			"",
-			hints(
-				[2]string{"enter", "run"},
-				[2]string{"q", "quit"},
-			),
+			hints(pairs...),
 		)
 		fmt.Println(pageStyle.Render(footer))
-		if pressedEnter() {
+		switch readKey(m.latestVersion != "") {
+		case 'r':
 			m.exitAndRun = true
+		case 'u':
+			m.exitAndUpdate = true
 		}
+	}
+	if m.exitAndUpdate {
+		printUpgrade(m.latestVersion)
+		return
 	}
 	if m.exitAndRun && m.command != "" {
 		fmt.Printf("\033[2m$\033[0m %s\n", m.command)
