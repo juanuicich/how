@@ -17,15 +17,9 @@ Pick a key: run it, refine it, or get an explanation in Markdown. That's the who
 
 ## Install
 
-### Homebrew (macOS, Linux)
-
-```sh
-brew install juanuicich/tap/how
-```
-
 ### From a release binary
 
-Grab the right archive for your OS/arch from the [Releases page](https://github.com/juanuicich/how/releases), then:
+Grab the archive for your OS/arch from the [Releases page](https://github.com/juanuicich/how/releases), then:
 
 ```sh
 tar -xzf how_*_darwin_arm64.tar.gz
@@ -95,9 +89,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-GitHub Actions takes it from there: cross-compiled binaries land on the Releases page and the Homebrew formula at [`juanuicich/homebrew-tap`](https://github.com/juanuicich/homebrew-tap) is updated automatically.
-
-The workflow needs one secret on this repo: `HOMEBREW_TAP_GITHUB_TOKEN`, a PAT with `contents: write` on the tap repo. Without it the binaries still ship; only the brew bump is skipped.
+GitHub Actions takes it from there: cross-compiled `darwin`/`linux` × `amd64`/`arm64` archives, checksums, and release notes land on the Releases page.
 
 ## License
 
