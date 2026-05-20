@@ -9,10 +9,10 @@ import (
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 // version is overridden at build time via -ldflags "-X main.version=...".
@@ -31,7 +31,6 @@ const (
 	stateCommand
 	stateRefine
 	stateExplainLoading
-	stateExplain
 )
 
 type claudeMsg struct {
@@ -47,7 +46,6 @@ type model struct {
 	history       []turn
 	spinner       spinner.Model
 	input         textinput.Model
-	viewport      viewport.Model
 	width         int
 	height        int
 	err           error
@@ -83,6 +81,8 @@ var (
 	keyStyle  = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	errStyle  = lipgloss.NewStyle().Foreground(danger)
 	spinStyle = lipgloss.NewStyle().Foreground(accent)
+
+	refineJoiner = " " + lipgloss.NewStyle().Foreground(accent).Bold(true).Render("+") + " "
 )
 
 func initialModel(question string) model {
@@ -98,22 +98,19 @@ func initialModel(question string) model {
 	ti.CharLimit = 500
 	ti.Width = 60
 
-	vp := viewport.New(80, 20)
-
 	return model{
 		state:    stateLoading,
 		question: question,
 		spinner:  sp,
 		input:    ti,
-		viewport: vp,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, callClaude(nil, m.question, false))
+	return tea.Batch(m.spinner.Tick, callClaude(nil, m.question, false, 0))
 }
 
-func callClaude(history []turn, userMsg string, forExplain bool) tea.Cmd {
+func callClaude(history []turn, userMsg string, forExplain bool, wrapWidth int) tea.Cmd {
 	return func() tea.Msg {
 		var prompt string
 		if forExplain {
@@ -139,7 +136,15 @@ func callClaude(history []turn, userMsg string, forExplain bool) tea.Cmd {
 		if err != nil {
 			return claudeMsg{err: err, forExplain: forExplain}
 		}
-		return claudeMsg{content: strings.TrimSpace(string(out)), forExplain: forExplain}
+		content := strings.TrimSpace(string(out))
+		if forExplain {
+			if r, rerr := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(wrapWidth)); rerr == nil {
+				if rendered, rerr := r.Render(content); rerr == nil {
+					content = rendered
+				}
+			}
+		}
+		return claudeMsg{content: content, forExplain: forExplain}
 	}
 }
 
@@ -164,8 +169,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.viewport.Width = max(40, msg.Width-6)
-		m.viewport.Height = max(8, msg.Height-14)
 		m.input.Width = max(20, msg.Width-12)
 		return m, nil
 
@@ -176,14 +179,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.forExplain {
-			rendered, err := glamour.Render(msg.content, "dark")
-			if err != nil {
-				rendered = msg.content
-			}
-			m.viewport.SetContent(rendered)
-			m.explainOutput = rendered
-			m.state = stateExplain
-			return m, nil
+			m.explainOutput = msg.content
+			return m, tea.Quit
 		}
 		cmd := cleanCommand(msg.content)
 		m.command = cmd
@@ -213,7 +210,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, textinput.Blink
 			case "e":
 				m.state = stateExplainLoading
-				return m, tea.Batch(m.spinner.Tick, callClaude(nil, m.command, true))
+				return m, tea.Batch(m.spinner.Tick, callClaude(nil, m.command, true, max(40, m.width-6)))
 			}
 		case stateRefine:
 			switch msg.String() {
@@ -228,24 +225,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if q == "" {
 					return m, nil
 				}
-				m.question = q
+				m.question = m.question + refineJoiner + q
 				m.state = stateLoading
 				m.input.Blur()
-				return m, tea.Batch(m.spinner.Tick, callClaude(m.history, q, false))
+				return m, tea.Batch(m.spinner.Tick, callClaude(m.history, q, false, 0))
 			}
 			var cmd tea.Cmd
 			m.input, cmd = m.input.Update(msg)
-			return m, cmd
-		case stateExplain:
-			switch msg.String() {
-			case "q", "esc", "ctrl+c":
-				return m, tea.Quit
-			case "enter":
-				m.exitAndRun = true
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			m.viewport, cmd = m.viewport.Update(msg)
 			return m, cmd
 		case stateExplainLoading:
 			if msg.String() == "ctrl+c" {
@@ -310,22 +296,26 @@ func (m model) View() string {
 			"",
 			m.spinner.View()+" "+questionStyle.Render("explaining..."),
 		)
-
-	case stateExplain:
-		sections = append(sections,
-			m.viewport.View(),
-			"",
-			box.Render(m.command),
-			"",
-			hints(
-				[2]string{"enter", "run"},
-				[2]string{"↑↓", "scroll"},
-				[2]string{"q/esc", "quit"},
-			),
-		)
 	}
 
 	return pageStyle.Render(lipgloss.JoinVertical(lipgloss.Left, sections...))
+}
+
+func pressedEnter() bool {
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return false
+	}
+	old, err := term.MakeRaw(fd)
+	if err != nil {
+		return false
+	}
+	defer term.Restore(fd, old)
+	var buf [1]byte
+	if _, err := os.Stdin.Read(buf[:]); err != nil {
+		return false
+	}
+	return buf[0] == '\r' || buf[0] == '\n'
 }
 
 func hints(pairs ...[2]string) string {
@@ -372,7 +362,7 @@ func main() {
 	}
 	question := strings.Join(os.Args[1:], " ")
 
-	p := tea.NewProgram(initialModel(question), tea.WithAltScreen())
+	p := tea.NewProgram(initialModel(question))
 	finalModel, err := p.Run()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -383,13 +373,23 @@ func main() {
 	if !ok {
 		os.Exit(1)
 	}
-	if m.explainOutput != "" {
+	if m.explainOutput != "" && m.command != "" && !m.exitAndRun {
 		fmt.Print(m.explainOutput)
-	}
-	if m.explainOutput != "" && !m.exitAndRun && m.command != "" {
 		contentW := max(20, m.width-4)
 		boxW := max(10, contentW-6)
-		fmt.Println(commandBox.Width(boxW).Render(m.command))
+		footer := lipgloss.JoinVertical(
+			lipgloss.Left,
+			commandBox.Width(boxW).Render(m.command),
+			"",
+			hints(
+				[2]string{"enter", "run"},
+				[2]string{"q", "quit"},
+			),
+		)
+		fmt.Println(pageStyle.Render(footer))
+		if pressedEnter() {
+			m.exitAndRun = true
+		}
 	}
 	if m.exitAndRun && m.command != "" {
 		fmt.Printf("\033[2m$\033[0m %s\n", m.command)
