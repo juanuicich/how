@@ -1,0 +1,12 @@
+# build artifacts
+/how
+/dist/
+
+# editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# recordings
+*.cast

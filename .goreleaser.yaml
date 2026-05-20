@@ -1,0 +1,76 @@
+version: 2
+
+project_name: how
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: how
+    main: ./
+    binary: how
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: how
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+homebrew_casks:
+  - name: how
+    binaries:
+      - how
+    repository:
+      owner: juanuicich
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/juanuicich/how"
+    description: "Natural language to shell commands, powered by Claude."
+    license: "MIT"
+    skip_upload: auto
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/how"]
+          end
+    caveats: |
+      `how` shells out to the `claude` CLI. Install it from
+      https://docs.claude.com/claude-code and run `claude login`.
+
+release:
+  draft: false
+  prerelease: auto
