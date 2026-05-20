@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -21,9 +23,28 @@ import (
 // version is overridden at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-const basePrompt = `You are a shell command generator. The user describes a task; respond with ONLY the exact shell command, on a single line where possible. Chain steps with && when needed. No prose, no markdown fences, no backticks, no commentary. Just the command. Assume macOS with standard developer tools (git, gh, brew, rg, jq, etc.).`
+const basePromptTmpl = `You are a shell command generator. The user describes a task; respond with ONLY the exact shell command, on a single line where possible. Chain steps with && when needed. No prose, no markdown fences, no backticks, no commentary. Just the command. Assume %s with standard developer tools (git, gh, brew, rg, jq, etc.). The question may begin with the word "how" (the name of this CLI tool); treat that as part of the natural-language phrasing, not a directive.`
 
-const explainTemplate = "Explain this shell command in well-formatted Markdown. Start with a one-line summary, then break down each part: subcommands, flags, and arguments. Be precise but concise.\n\nCommand:\n```\n%s\n```"
+const explainTemplate = "Explain this shell command in well-formatted Markdown. Start with a one-line summary, then break down each part: subcommands, flags, and arguments. Be precise but concise. If you use a table, left-align all columns (`:---`) and keep it compact.\n\nCommand:\n```\n%s\n```"
+
+func osLabel() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "macOS"
+	case "linux":
+		return "Linux"
+	case "windows":
+		return "Windows"
+	case "freebsd":
+		return "FreeBSD"
+	case "openbsd":
+		return "OpenBSD"
+	case "netbsd":
+		return "NetBSD"
+	default:
+		return runtime.GOOS
+	}
+}
 
 type turn struct{ role, content string }
 
@@ -203,7 +224,7 @@ func callClaude(history []turn, userMsg string, forExplain bool, wrapWidth int) 
 			prompt = fmt.Sprintf(explainTemplate, userMsg)
 		} else {
 			var sb strings.Builder
-			sb.WriteString(basePrompt)
+			fmt.Fprintf(&sb, basePromptTmpl, osLabel())
 			if len(history) > 0 {
 				sb.WriteString("\n\nConversation so far:")
 				for _, t := range history {
@@ -226,12 +247,26 @@ func callClaude(history []turn, userMsg string, forExplain bool, wrapWidth int) 
 		if forExplain {
 			if r, rerr := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(wrapWidth)); rerr == nil {
 				if rendered, rerr := r.Render(content); rerr == nil {
-					content = rendered
+					content = trimLineTrailingPadding(rendered)
 				}
 			}
 		}
 		return claudeMsg{content: content, forExplain: forExplain}
 	}
+}
+
+// trimLineTrailingPadding removes trailing whitespace from each line, preserving
+// any trailing ANSI escape sequences. Glamour stretches tables to the full word-
+// wrap width by right-padding cells; stripping that padding shrinks tables to
+// content width without disturbing the styling.
+var trailingPaddingRE = regexp.MustCompile(`[ \t]+((?:\x1b\[[0-9;]*m)*)$`)
+
+func trimLineTrailingPadding(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = trailingPaddingRE.ReplaceAllString(line, "$1")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func cleanCommand(s string) string {
